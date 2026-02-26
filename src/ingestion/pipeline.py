@@ -3,6 +3,8 @@ import json
 import logging
 from src.ingestion.parser import PDFParser
 from src.ingestion.splitter import MarkdownSplitter
+from src.ingestion.indexer import HybridIndexer
+from langchain_core.documents import Document
 
 try:
     from dotenv import load_dotenv
@@ -26,6 +28,8 @@ def ingest_pdfs():
         
     parser = PDFParser()
     splitter = MarkdownSplitter()
+    # Initialize Hybrid Indexer
+    indexer = HybridIndexer()
 
     sources = []
     for filename in os.listdir(RAW_DIR):
@@ -74,6 +78,8 @@ def ingest_pdfs():
                 "sections": [],
             }
 
+            documents_to_index = []
+
             for i, section in enumerate(sections):
                 section_filename = f"section_{i:03d}.md"
                 section_path = os.path.join(sections_dir, section_filename)
@@ -84,6 +90,20 @@ def ingest_pdfs():
                 index_data["sections"].append(
                     {"title": section["title"], "filename": section_filename, "level": section["level"]}
                 )
+
+                # Create Document for indexing
+                doc_metadata = {
+                    "paper_id": paper_id,
+                    "title": title,
+                    "section_title": section["title"],
+                    "source": source
+                }
+                documents_to_index.append(
+                    Document(page_content=section["content"], metadata=doc_metadata)
+                )
+
+            # Add to Hybrid Index
+            indexer.add_documents(documents_to_index)
 
             with open(os.path.join(paper_dir, "index.json"), "w", encoding="utf-8") as f:
                 json.dump(index_data, f, indent=2, ensure_ascii=False)

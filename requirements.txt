@@ -11,3 +11,5 @@ pymupdf
 numpy
 scikit-learn
 rank_bm25
+faiss-cpu
+sqlite-utils

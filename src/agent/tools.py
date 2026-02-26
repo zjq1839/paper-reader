@@ -1,32 +1,27 @@
 import os
 import json
+import datetime
+import math
 from typing import Any, List, Dict, Optional
-try:
-    from langchain_core.tools import tool
-except Exception:
-    class _FallbackTool:
-        def __init__(self, func):
-            self._func = func
-            self.__name__ = getattr(func, "__name__", "tool")
-            self.__doc__ = getattr(func, "__doc__", None)
-
-        def invoke(self, args: Optional[Dict[str, Any]] = None) -> Any:
-            if args is None:
-                args = {}
-            return self._func(**args)
-
-        def __call__(self, *args, **kwargs):
-            return self._func(*args, **kwargs)
-
-    def tool(func):
-        return _FallbackTool(func)
+from langchain_core.tools import tool
 
 DATA_DIR = os.path.join(os.getcwd(), "data", "processed")
+MEMORY_DIR = os.path.join(os.getcwd(), "data", "memory")
+
+# Ensure memory directory exists
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+EPISODIC_MEMORY_FILE = os.path.join(MEMORY_DIR, "episodic_memory.jsonl")
+SEMANTIC_KNOWLEDGE_FILE = os.path.join(MEMORY_DIR, "semantic_knowledge.md")
 
 def _get_paper_dir(paper_id: str) -> str:
     return os.path.join(DATA_DIR, paper_id)
 
-def get_library_structure_impl() -> List[Dict[str, Any]]:
+@tool
+def get_library_structure() -> List[Dict[str, Any]]:
+    """
+    Get the list of available papers and their high-level outline (sections).
+    """
     library: List[Dict[str, Any]] = []
     if not os.path.exists(DATA_DIR):
         return []
@@ -49,13 +44,6 @@ def get_library_structure_impl() -> List[Dict[str, Any]]:
     return library
 
 @tool
-def get_library_structure() -> List[Dict[str, Any]]:
-    """
-    Get the list of available papers and their high-level outline (sections).
-    """
-    return get_library_structure_impl()
-
-@tool
 def read_section_content(paper_id: str, section_title: str) -> str:
     """
     Read the full content of a specific section from a paper.
@@ -63,9 +51,6 @@ def read_section_content(paper_id: str, section_title: str) -> str:
     paper_path = _get_paper_dir(paper_id)
     sections_dir = os.path.join(paper_path, "sections")
     
-    # We need to find the file corresponding to the section title
-    # This assumes we save sections with titles as filenames or use an index.
-    # For MVP, let's look up the filename from index.json
     index_path = os.path.join(paper_path, "index.json")
     if not os.path.exists(index_path):
         return "Error: Paper index not found."
@@ -104,3 +89,63 @@ def report_status(status: str) -> str:
     The model should call this before other tools, with a short Chinese phrase.
     """
     return json.dumps({"type": "status", "status": status}, ensure_ascii=False)
+
+@tool
+def search_episodic_memory(query: str, time_range: str = "all") -> str:
+    """
+    Search historical experimental reasoning records with time decay factor.
+    query: The search query.
+    time_range: 'all', 'recent' (last 24h), 'week' (last 7 days).
+    """
+    if not os.path.exists(EPISODIC_MEMORY_FILE):
+        return "No episodic memory found."
+
+    results = []
+    now = datetime.datetime.now()
+    
+    with open(EPISODIC_MEMORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+                timestamp = datetime.datetime.fromisoformat(record["timestamp"])
+                
+                # Time filtering
+                if time_range == "recent" and (now - timestamp).total_seconds() > 86400:
+                    continue
+                if time_range == "week" and (now - timestamp).total_seconds() > 604800:
+                    continue
+
+                # Simple keyword match (replace with embedding search if needed later)
+                if query.lower() in record["content"].lower():
+                    # Calculate decay factor (Ebbinghaus-like: 1 / (1 + log(t+1)))
+                    # t in hours
+                    hours_diff = (now - timestamp).total_seconds() / 3600
+                    decay = 1.0 / (1.0 + math.log(hours_diff + 1))
+                    
+                    results.append({
+                        "content": record["content"],
+                        "timestamp": record["timestamp"],
+                        "score": decay
+                    })
+            except Exception:
+                continue
+
+    # Sort by score (decay factor implies recency/strength)
+    results.sort(key=lambda x: x["score"], reverse=True)
+    
+    if not results:
+        return "No matching episodic memory found."
+        
+    return json.dumps(results[:5], indent=2, ensure_ascii=False)
+
+@tool
+def update_semantic_knowledge(topic: str, conclusion: str) -> str:
+    """
+    Write a distilled research pattern or key breakthrough to the global Tier 1 knowledge base.
+    """
+    entry = f"\n## {topic}\n- **Date:** {datetime.datetime.now().isoformat()}\n- **Conclusion:** {conclusion}\n"
+    
+    with open(SEMANTIC_KNOWLEDGE_FILE, "a", encoding="utf-8") as f:
+        f.write(entry)
+        
+    return f"Successfully updated semantic knowledge for topic: {topic}"
