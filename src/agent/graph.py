@@ -57,7 +57,7 @@ llm = ChatNVIDIA(
 
 llm_with_tools = llm.bind_tools(tools)
 
-def agent_node(state: AgentState):
+async def agent_node(state: AgentState):
     messages = state["messages"]
     
     core_constraints = load_core_constraints()
@@ -76,7 +76,7 @@ def agent_node(state: AgentState):
 Please assist the user with their research inquiries.
 """
     
-    response = llm_with_tools.invoke([SystemMessage(content=system_prompt)] + messages)
+    response = await llm_with_tools.ainvoke([SystemMessage(content=system_prompt)] + messages)
     return {"messages": [response]}
 
 def compaction_node(state: AgentState):

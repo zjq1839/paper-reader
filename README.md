@@ -10,8 +10,8 @@ DeepScholar 是一个面向论文精读与研究灵感生成的 AI 研究助手�
 ## 技术栈
 
 - 语言：Python
-- UI：Chainlit（聊天 UI + 侧边栏 Workspace）
-- Agent：LangChain（`create_agent`）+ NVIDIA NIM（`langchain-nvidia-ai-endpoints` 的 `ChatNVIDIA`）
+- UI：Chainlit（聊天 UI + 侧边栏 Workspace + Agent Trace）
+- Agent：LangGraph + LangChain + NVIDIA NIM（`langchain-nvidia-ai-endpoints` 的 `ChatNVIDIA`）
 - 文档解析：MinerU（`magic-pdf`，本地或 API）+ PyMuPDF（失败回退/本地解析）
 - 配置：python-dotenv（加载 `.env`）
 - 预留依赖（当前代码未显式使用）：FastAPI、uvicorn、numpy、scikit-learn、rank_bm25
@@ -30,6 +30,7 @@ flowchart TD
   T2 --> FS
   T3 --> CL
   T4 --> CL
+  CL -->|trace events| TR[(data/memory/traces\n*.jsonl)]
 
   subgraph ING[离线摄取（Ingestion）]
     PDF[PDF / PDF URL\n(data/raw_pdfs)] --> P[PDFParser\nsrc/ingestion/parser.py]
@@ -46,11 +47,11 @@ flowchart TD
   - [`parser.py`](file:///e:/work/paper-reader/src/ingestion/parser.py)：优先使用 MinerU（本地 `magic-pdf` 或 MinerU API），失败回退到 PyMuPDF（仅支持本地 PDF）。
   - [`splitter.py`](file:///e:/work/paper-reader/src/ingestion/splitter.py)：按一级标题（H1）切分 Markdown 为章节分段。
 - Agent 与工具（`src/agent/*`）
-  - [`lc_agent.py`](file:///e:/work/paper-reader/src/agent/lc_agent.py)：用 `ChatNVIDIA` 构建 LLM，并通过 `create_agent` 组合工具与系统提示词。
+  - [`lc_agent.py`](file:///e:/work/paper-reader/src/agent/lc_agent.py)：LangGraph 工作流入口（对外暴露 `agent`）。
   - [`prompts.py`](file:///e:/work/paper-reader/src/agent/prompts.py)：约束 Agent 的“先看大纲再读章节”“先 `report_status` 再调用其它工具”等策略。
   - [`tools.py`](file:///e:/work/paper-reader/src/agent/tools.py)：从 `data/processed/` 读取论文结构与章节内容，并通过 `WORKSPACE_UPDATE::` 协议与 UI 同步侧边栏笔记。
 - UI 入口（`src/app.py`）
-  - [`app.py`](file:///e:/work/paper-reader/src/app.py)：Chainlit 事件处理（chat_start/on_message）、历史消息管理、侧边栏 Workspace 渲染、进度 Step 显示。
+  - [`app.py`](file:///e:/work/paper-reader/src/app.py)：Chainlit 事件处理（chat_start/on_message）、历史消息管理、侧边栏 Workspace 渲染、LLM/工具轨迹 Step 展示，并将事件落盘到 `data/memory/traces/*.jsonl`。
 
 ## 项目目录结构
 
@@ -66,13 +67,15 @@ e:\work\paper-reader
 │           ├── index.json          # 标题 + sections 元数据
 │           └── sections/
 │               └── section_*.md    # 分段后的章节内容
+│   └── memory/                     # 运行期记忆/轨迹（启动后自动创建）
+│       └── traces/                 # 每轮对话的事件轨迹（jsonl）
 ├── src/
 │   ├── app.py
 │   ├── agent/
 │   │   ├── lc_agent.py
 │   │   ├── prompts.py
 │   │   ├── tools.py
-│   │   └── graph.py               # 已弃用（会直接 raise）
+│   │   └── graph.py               # LangGraph 工作流定义
 │   └── ingestion/
 │       ├── pipeline.py
 │       ├── parser.py
@@ -173,6 +176,11 @@ cd e:\work\paper-reader
 cd e:\work\paper-reader
 .\.venv\Scripts\python.exe -m chainlit run src/app.py -w
 ```
+
+启动后：
+
+- 右侧边栏包含 **Research Workspace** 与 **Agent Trace**（LLM/工具的时间线与耗时）
+- 每轮对话的轨迹会追加写入 `data/memory/traces/<trace_session_id>.jsonl`
 
 ## 生产部署指南
 
@@ -296,6 +304,7 @@ docs: update README for deployment
 | `magic-pdf` 安装/导入失败 | 系统依赖/平台兼容问题 | 使用 PyMuPDF 回退（仅本地 PDF）；或改用 MinerU API（配置 token） |
 | 摄取后 `data/processed/` 为空 | `data/raw_pdfs/` 下无 PDF/URL 列表或文件名不匹配 | 确认 `data/raw_pdfs/` 下存在 `.pdf` 或 `.txt/.urls`，并重新运行摄取命令 |
 | 侧边栏不更新 | Agent 未调用 `update_workspace` 或前缀不匹配 | 确认工具输出以 `WORKSPACE_UPDATE::` 开头（见 [`tools.py`](file:///e:/work/paper-reader/src/agent/tools.py)） |
+| 响应很慢/看起来卡住 | 模型推理或工具调用耗时较长 | 查看右侧 **Agent Trace** 的时间线与耗时；需要离线分析可打开 `data/memory/traces/*.jsonl` |
 
 ## Markdown 语法检查（格式验证）
 
