@@ -8,8 +8,9 @@ uvicorn
 python-dotenv
 magic-pdf>=0.7.0
 pymupdf
-numpy
+numpy<2
 scikit-learn
 rank_bm25
 faiss-cpu
 sqlite-utils
+openai

@@ -109,6 +109,12 @@ def _normalize_history(items):
             normalized.append(it)
     return normalized
 
+def _truncate_text(text: str, limit: int = 4000) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n（内容过长，已截断）"
+
 @cl.on_chat_start
 async def start():
     cl.user_session.set("workspace", "")
@@ -125,13 +131,14 @@ async def update_workspace_ui(content: str):
     """
     if not content:
         content = "*Workspace is empty.*"
-        
-    for_id = cl.user_session.get("workspace_for_id")
-    if not for_id:
-        return
-
-    workspace_element = cl.Text(name="Research Workspace", content=content, display="side")
-    await workspace_element.send(for_id=for_id)
+    try:
+        await cl.ElementSidebar.set_title("Research Workspace")
+        await cl.ElementSidebar.set_elements([cl.Text(name="Research Workspace", content=content)])
+    except Exception:
+        for_id = cl.user_session.get("workspace_for_id")
+        if not for_id:
+            return
+        await cl.Text(name="Research Workspace", content=content, display="inline").send(for_id=for_id)
 
 @cl.on_message
 async def main(message: cl.Message):
@@ -177,6 +184,11 @@ async def main(message: cl.Message):
             break
 
     if final_content:
+        current_workspace = str(cl.user_session.get("workspace", "") or "").strip()
+        if not current_workspace:
+            if ("工作区" in final_content) or ("workspace" in final_content.lower()):
+                cl.user_session.set("workspace", _truncate_text(final_content))
+                await update_workspace_ui(_truncate_text(final_content))
         await cl.Message(content=final_content).send()
     else:
         await cl.Message(content="（本轮模型没有返回可展示的文本内容）").send()

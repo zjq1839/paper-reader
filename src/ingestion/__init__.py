@@ -1,3 +1,8 @@
 from .parser import PDFParser
 from .splitter import MarkdownSplitter
-from .indexer import Indexer
+try:
+    from .indexer import HybridIndexer
+except Exception:
+    HybridIndexer = None
+
+Indexer = HybridIndexer

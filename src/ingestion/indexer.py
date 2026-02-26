@@ -1,27 +1,121 @@
 import os
 import sqlite3
 import json
+from typing import List, Any, Optional, Tuple
+
 import numpy as np
-from typing import List, Dict, Any, Tuple
+import faiss
+from openai import OpenAI
 from langchain_core.documents import Document
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
-from rank_bm25 import BM25Okapi
-import pickle
+
+
+class NvidiaBgeM3Embeddings:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "baai/bge-m3",
+    ):
+        resolved_api_key = (api_key or os.environ.get("NVIDIA_API_KEY", "")).strip().strip('"').strip("'")
+        if not resolved_api_key:
+            raise RuntimeError("NVIDIA_API_KEY 未设置，无法生成 embedding")
+        resolved_base_url = (base_url or os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")).strip()
+        resolved_base_url = resolved_base_url.strip("`").strip().strip('"').strip("'")
+
+        self._client = OpenAI(api_key=resolved_api_key, base_url=resolved_base_url)
+        self._model = (os.environ.get("NVIDIA_EMBED_MODEL", model) or model).strip()
+
+    def embed_documents(self, texts: List[str]) -> np.ndarray:
+        clean = [t if isinstance(t, str) else str(t) for t in (texts or [])]
+        clean = [t.strip() for t in clean if isinstance(t, str) and t.strip()]
+        if not clean:
+            return np.zeros((0, 0), dtype=np.float32)
+        res = self._client.embeddings.create(
+            input=clean,
+            model=self._model,
+            encoding_format="float",
+            extra_body={"truncate": "NONE"},
+        )
+        vectors = [np.asarray(item.embedding, dtype=np.float32) for item in res.data]
+        return np.stack(vectors, axis=0)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        mat = self.embed_documents([text])
+        return mat[0]
+
+
+class LocalFaissStore:
+    def __init__(self, dir_path: str, embeddings: NvidiaBgeM3Embeddings):
+        self._dir_path = dir_path
+        self._embeddings = embeddings
+        self._index_path = os.path.join(dir_path, "index.faiss")
+        self._docstore_path = os.path.join(dir_path, "docstore.json")
+        self._index: Optional[faiss.Index] = None
+        self._docs: List[Document] = []
+        os.makedirs(dir_path, exist_ok=True)
+        self._load()
+
+    def _load(self) -> None:
+        if os.path.exists(self._docstore_path):
+            with open(self._docstore_path, "r", encoding="utf-8") as f:
+                raw = json.load(f) or []
+            self._docs = [Document(page_content=item["page_content"], metadata=item.get("metadata") or {}) for item in raw]
+
+        if os.path.exists(self._index_path):
+            self._index = faiss.read_index(self._index_path)
+
+    def _save(self) -> None:
+        if self._index is not None:
+            faiss.write_index(self._index, self._index_path)
+        payload = [{"page_content": d.page_content, "metadata": d.metadata} for d in self._docs]
+        with open(self._docstore_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+    def add_documents(self, documents: List[Document]) -> None:
+        if not documents:
+            return
+        kept: List[Document] = [d for d in documents if isinstance(d.page_content, str) and d.page_content.strip()]
+        if not kept:
+            return
+        texts = [d.page_content for d in kept]
+        vecs = self._embeddings.embed_documents(texts)
+        if vecs.size == 0:
+            return
+
+        faiss.normalize_L2(vecs)
+        dim = int(vecs.shape[1])
+        if self._index is None:
+            self._index = faiss.IndexFlatIP(dim)
+        self._index.add(vecs)
+        self._docs.extend(kept)
+        self._save()
+
+    def similarity_search_with_score(self, query: str, k: int) -> List[Tuple[Document, float]]:
+        if self._index is None or not self._docs:
+            return []
+        q = self._embeddings.embed_query(query).astype(np.float32)
+        q = np.expand_dims(q, axis=0)
+        faiss.normalize_L2(q)
+        scores, idxs = self._index.search(q, k)
+        out: List[Tuple[Document, float]] = []
+        for i, score in zip(idxs[0].tolist(), scores[0].tolist()):
+            if i < 0 or i >= len(self._docs):
+                continue
+            out.append((self._docs[i], float(score)))
+        return out
 
 class HybridIndexer:
     def __init__(self, db_path: str = "data/hybrid_index.db", vector_db_path: str = "data/faiss_index"):
         self.db_path = db_path
         self.vector_db_path = vector_db_path
-        self.embeddings = OpenAIEmbeddings()
-        self.vector_store = None
+        self.embeddings = NvidiaBgeM3Embeddings()
+        self.vector_store = LocalFaissStore(self.vector_db_path, self.embeddings)
         
         # Ensure directories exist
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         os.makedirs(os.path.dirname(vector_db_path), exist_ok=True)
 
         self._init_sqlite()
-        self._load_vector_store()
 
     def _init_sqlite(self):
         """Initialize SQLite database with FTS5 for BM25."""
@@ -38,23 +132,18 @@ class HybridIndexer:
         conn.commit()
         conn.close()
 
-    def _load_vector_store(self):
-        """Load or initialize FAISS vector store."""
-        if os.path.exists(os.path.join(self.vector_db_path, "index.faiss")):
-            self.vector_store = FAISS.load_local(self.vector_db_path, self.embeddings, allow_dangerous_deserialization=True)
-        else:
-            # Initialize empty store (will be populated later)
-            pass
-
     def add_documents(self, documents: List[Document]):
         """Add documents to both SQLite FTS and FAISS vector store."""
         if not documents:
+            return
+        kept: List[Document] = [d for d in documents if isinstance(d.page_content, str) and d.page_content.strip()]
+        if not kept:
             return
 
         # 1. Add to SQLite FTS
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        for doc in documents:
+        for doc in kept:
             cursor.execute(
                 "INSERT INTO documents_fts (content, metadata) VALUES (?, ?)",
                 (doc.page_content, json.dumps(doc.metadata))
@@ -63,12 +152,7 @@ class HybridIndexer:
         conn.close()
 
         # 2. Add to Vector Store
-        if self.vector_store is None:
-            self.vector_store = FAISS.from_documents(documents, self.embeddings)
-        else:
-            self.vector_store.add_documents(documents)
-        
-        self.vector_store.save_local(self.vector_db_path)
+        self.vector_store.add_documents(kept)
 
     def search(self, query: str, k: int = 5, alpha: float = 0.7) -> List[Document]:
         """
@@ -77,82 +161,46 @@ class HybridIndexer:
         """
         # 1. Vector Search
         vector_results = []
-        if self.vector_store:
-            # Returns (doc, score) where score is L2 distance (lower is better)
-            # We need to convert to similarity or normalize.
-            # FAISS similarity_search_with_score returns L2 distance for default index
-            vector_results_raw = self.vector_store.similarity_search_with_score(query, k=k*2)
-            
-            # Normalize vector scores (L2 distance -> similarity)
-            # Simple inversion for now: 1 / (1 + distance)
-            vector_results = [
-                (doc, 1.0 / (1.0 + score)) for doc, score in vector_results_raw
-            ]
+        vector_results_raw = self.vector_store.similarity_search_with_score(query, k=k * 2)
+        vector_results = vector_results_raw
 
         # 2. Keyword Search (SQLite FTS)
-        keyword_results = []
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # FTS5 rank is not standard BM25 score but we can use bm25() function if available or simple rank
-        # Standard FTS5 search by rank
         cursor.execute("""
-            SELECT content, metadata, rank 
+            SELECT content, metadata, bm25(documents_fts) AS score
             FROM documents_fts 
             WHERE documents_fts MATCH ? 
-            ORDER BY rank 
+            ORDER BY score 
             LIMIT ?
         """, (query, k*2))
         
         rows = cursor.fetchall()
         conn.close()
-
-        # FTS rank is usually lower is better (more negative). Let's normalize.
-        # However, sqlite fts5 'rank' output depends on the function used.
-        # Default rank is just a score.
-        # Let's assume we get some results. We can treat them as "matched".
-        # For better scoring, we might want to do BM25 in python if the dataset is small enough,
-        # but for scalability we rely on FTS.
-        # To strictly follow MRD "70% Vector + 30% BM25", we need comparable scores.
-        # A robust way is Reciprocal Rank Fusion (RRF) or just normalizing ranks.
         
-        # Let's use RRF for simplicity and robustness as scores are hard to normalize across different engines.
-        # Score = alpha * (1/rank_vec) + (1-alpha) * (1/rank_fts)
-        
-        doc_map = {} # content_hash -> {doc, vec_rank, fts_rank}
+        doc_map = {}
 
-        # Process Vector Results
         for rank, (doc, score) in enumerate(vector_results):
-            # Create a unique ID for the doc (e.g. hash of content)
             doc_id = hash(doc.page_content)
             if doc_id not in doc_map:
-                doc_map[doc_id] = {'doc': doc, 'vec_rank': rank + 1, 'fts_rank': 1000} # Default high rank
+                doc_map[doc_id] = {"doc": doc, "vec_rank": rank + 1, "fts_rank": 1000}
             else:
-                doc_map[doc_id]['vec_rank'] = rank + 1
+                doc_map[doc_id]["vec_rank"] = rank + 1
 
-        # Process FTS Results
         for rank, (content, metadata_json, score) in enumerate(rows):
             metadata = json.loads(metadata_json)
             doc = Document(page_content=content, metadata=metadata)
             doc_id = hash(content)
             if doc_id not in doc_map:
-                doc_map[doc_id] = {'doc': doc, 'vec_rank': 1000, 'fts_rank': rank + 1}
+                doc_map[doc_id] = {"doc": doc, "vec_rank": 1000, "fts_rank": rank + 1}
             else:
-                doc_map[doc_id]['fts_rank'] = rank + 1
+                doc_map[doc_id]["fts_rank"] = rank + 1
 
-        # Calculate Fusion Score
         fused_results = []
         for doc_id, data in doc_map.items():
-            # RRF score
-            # score = alpha * (1/vec_rank) + (1-alpha) * (1/fts_rank)
-            # Or use the MRD's weighted fusion if we had normalized scores.
-            # Given we don't have true BM25 scores from SQLite easily without extensions, RRF is safer.
-            # But the MRD asks for "Standardized scores then weighted fusion".
-            # Let's try to stick to RRF as a practical implementation of "Hybrid".
-            
-            rrf_score = alpha * (1.0 / (60 + data['vec_rank'])) + (1.0 - alpha) * (1.0 / (60 + data['fts_rank']))
+            rrf_score = alpha * (1.0 / (60 + data["vec_rank"])) + (1.0 - alpha) * (1.0 / (60 + data["fts_rank"]))
             fused_results.append((data['doc'], rrf_score))
 
-        # Sort by score descending
         fused_results.sort(key=lambda x: x[1], reverse=True)
         
         return [doc for doc, score in fused_results[:k]]

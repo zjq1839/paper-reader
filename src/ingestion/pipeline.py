@@ -4,6 +4,7 @@ import logging
 from src.ingestion.parser import PDFParser
 from src.ingestion.splitter import MarkdownSplitter
 from src.ingestion.indexer import HybridIndexer
+from src.ingestion.chunker import chunk_text_by_tokens, get_chunking_config_from_env
 from langchain_core.documents import Document
 
 try:
@@ -30,6 +31,7 @@ def ingest_pdfs():
     splitter = MarkdownSplitter()
     # Initialize Hybrid Indexer
     indexer = HybridIndexer()
+    chunk_tokens, overlap_tokens = get_chunking_config_from_env()
 
     sources = []
     for filename in os.listdir(RAW_DIR):
@@ -98,9 +100,23 @@ def ingest_pdfs():
                     "section_title": section["title"],
                     "source": source
                 }
-                documents_to_index.append(
-                    Document(page_content=section["content"], metadata=doc_metadata)
-                )
+                content = (section.get("content") or "").strip()
+                if content:
+                    chunks = chunk_text_by_tokens(content, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+                    for c in chunks:
+                        documents_to_index.append(
+                            Document(
+                                page_content=c.text,
+                                metadata={
+                                    **doc_metadata,
+                                    "chunk_index": c.index,
+                                    "chunk_start_token": c.start_token,
+                                    "chunk_end_token": c.end_token,
+                                    "chunk_tokens": chunk_tokens,
+                                    "chunk_overlap_tokens": overlap_tokens,
+                                },
+                            )
+                        )
 
             # Add to Hybrid Index
             indexer.add_documents(documents_to_index)
