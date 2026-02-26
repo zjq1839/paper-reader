@@ -1,0 +1,13 @@
+langchain
+langchain-core
+langchain-nvidia-ai-endpoints
+langgraph
+chainlit
+fastapi
+uvicorn
+python-dotenv
+magic-pdf>=0.7.0
+pymupdf
+numpy
+scikit-learn
+rank_bm25
