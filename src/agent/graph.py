@@ -1,12 +1,13 @@
 import os
 from typing import Annotated, Literal, TypedDict
-from langchain_core.messages import SystemMessage, BaseMessage
+from langchain_core.messages import SystemMessage, BaseMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from src.agent.tools import (
     get_library_structure,
+    hybrid_search,
     read_section_content,
     update_workspace,
     report_status,
@@ -20,7 +21,7 @@ class AgentState(TypedDict):
     semantic_directives: str
     episodic_events: list[str]
 
-CORE_FILE = "DEEPSCHOLAR_CORE.md"
+CORE_FILE = os.path.join(os.getcwd(), "docs", "DEEPSCHOLAR_CORE.md")
 
 def load_core_constraints():
     if os.path.exists(CORE_FILE):
@@ -36,6 +37,7 @@ def load_core_constraints():
 
 tools = [
     get_library_structure,
+    hybrid_search,
     read_section_content,
     update_workspace,
     report_status,
@@ -60,10 +62,18 @@ llm_with_tools = llm.bind_tools(tools)
 async def agent_node(state: AgentState):
     messages = state["messages"]
     
+    # Calculate current workspace from message history
+    workspace_content = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and msg.content.startswith("WORKSPACE_UPDATE::"):
+            workspace_content.append(msg.content.split("WORKSPACE_UPDATE::", 1)[1].strip())
+    
+    working_workspace = "\n\n".join(workspace_content) if workspace_content else ""
+    
     core_constraints = load_core_constraints()
     state["semantic_directives"] = core_constraints
     
-    workspace = state.get("working_workspace", "No active workspace.")
+    workspace = working_workspace if working_workspace else "No active workspace."
     
     system_prompt = f"""You are DeepScholar, an advanced academic research agent.
 
@@ -74,10 +84,11 @@ async def agent_node(state: AgentState):
 {workspace}
 
 Please assist the user with their research inquiries.
+For evidence gathering, prefer calling `hybrid_search` to retrieve relevant snippets. Only call `read_section_content` when you need full-section context.
 """
     
     response = await llm_with_tools.ainvoke([SystemMessage(content=system_prompt)] + messages)
-    return {"messages": [response]}
+    return {"messages": [response], "working_workspace": working_workspace}
 
 def compaction_node(state: AgentState):
     """

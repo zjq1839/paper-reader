@@ -3,6 +3,7 @@ import sys
 import time
 import uuid
 import json
+import datetime
 from pathlib import Path
 
 project_root = str(Path(__file__).resolve().parents[1])
@@ -24,7 +25,7 @@ from typing import Any, Dict, Optional
 
 from src.agent.lc_agent import agent
 
-TRACE_DIR = os.path.join(os.getcwd(), "data", "memory", "traces")
+TRACE_DIR = os.path.join(project_root, "data", "memory", "traces")
 
 def _truncate_text(text: str, limit: int = 4000) -> str:
     text = (text or "").strip()
@@ -97,6 +98,69 @@ async def _render_sidebar(workspace: str, trace_md: str) -> None:
         await cl.Text(name="Research Workspace", content=ws, display="inline").send(for_id=for_id)
         await cl.Text(name="Agent Trace", content=tr, display="inline").send(for_id=for_id)
 
+def _read_jsonl(path: str, max_lines: int = 5000) -> list[Dict[str, Any]]:
+    items: list[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                s = (line or "").strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        items.append(obj)
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return items
+
+def _extract_workspace_from_events(events: list[Dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for ev in events or []:
+        if str(ev.get("type") or "").strip() != "tool_start":
+            continue
+        if str(ev.get("name") or "").strip() != "update_workspace":
+            continue
+        tool_input = ev.get("input")
+        payload = ""
+        if isinstance(tool_input, dict):
+            payload = str(tool_input.get("content") or "").strip()
+        elif isinstance(tool_input, str):
+            payload = tool_input.strip()
+        if payload:
+            parts.append(payload)
+    return "\n\n".join(parts).strip()
+
+def _pick_trace_session_id(prefer: Optional[str] = None, created_at: Optional[str] = None) -> Optional[str]:
+    if prefer:
+        candidate = os.path.join(TRACE_DIR, f"{prefer}.jsonl")
+        if os.path.exists(candidate):
+            return prefer
+
+    try:
+        if not os.path.isdir(TRACE_DIR):
+            return None
+        files = [os.path.join(TRACE_DIR, p) for p in os.listdir(TRACE_DIR) if p.endswith(".jsonl")]
+        if not files:
+            return None
+        created_ts: Optional[float] = None
+        if created_at:
+            try:
+                created_ts = datetime.datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                created_ts = None
+        if created_ts is not None:
+            files.sort(key=lambda p: (abs(os.path.getmtime(p) - created_ts), -os.path.getmtime(p)))
+        else:
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return Path(files[0]).stem
+    except Exception:
+        return None
+
 def _trace_markdown(events: list[Dict[str, Any]], limit: int = 60) -> str:
     items = (events or [])[-limit:]
     if not items:
@@ -138,6 +202,22 @@ class ProgressCallbackHandler(AsyncCallbackHandler):
         if not tool_input:
             return ""
         if isinstance(tool_input, dict):
+            if tool_name == "hybrid_search":
+                query = str(tool_input.get("query") or "").strip()
+                paper_id = str(tool_input.get("paper_id") or "").strip()
+                k = tool_input.get("k")
+                alpha = tool_input.get("alpha")
+                parts = []
+                if query:
+                    parts.append(f"query={query}")
+                if paper_id:
+                    parts.append(f"paper_id={paper_id}")
+                if k is not None:
+                    parts.append(f"k={k}")
+                if alpha is not None:
+                    parts.append(f"alpha={alpha}")
+                if parts:
+                    return _truncate_text("\n".join(parts), 800)
             if tool_name == "read_section_content":
                 paper_id = str(tool_input.get("paper_id") or "").strip()
                 section_title = str(tool_input.get("section_title") or "").strip()
@@ -359,11 +439,63 @@ async def start():
     await welcome.send()
     cl.user_session.set("workspace_for_id", welcome.id)
     
-    # Initialize workspace side view
+    auto_hydrate = str(os.environ.get("AUTO_HYDRATE_SIDEBAR", "0") or "").strip().lower() in ["1", "true", "yes", "y"]
+    if auto_hydrate:
+        hydrated_trace_session_id = _pick_trace_session_id()
+        if hydrated_trace_session_id:
+            hydrated_events = _read_jsonl(os.path.join(TRACE_DIR, f"{hydrated_trace_session_id}.jsonl"))
+            hydrated_workspace = _extract_workspace_from_events(hydrated_events)
+            cl.user_session.set("workspace", hydrated_workspace)
+            cl.user_session.set("trace_events", hydrated_events)
+            await _render_sidebar(hydrated_workspace, _trace_markdown(hydrated_events))
+            return
+
     await _render_sidebar("", "")
+
+@cl.on_chat_resume
+async def resume(thread: Dict[str, Any]):
+    trace_session_id = _pick_trace_session_id(
+        prefer=str((thread.get("metadata") or {}).get("trace_session_id") or "").strip() or None,
+        created_at=str(thread.get("createdAt") or "").strip() or None,
+    )
+    if trace_session_id:
+        events = _read_jsonl(os.path.join(TRACE_DIR, f"{trace_session_id}.jsonl"))
+        workspace = _extract_workspace_from_events(events)
+        cl.user_session.set("trace_session_id", trace_session_id)
+        cl.user_session.set("trace_events", events)
+        cl.user_session.set("workspace", workspace)
+        await _render_sidebar(workspace, _trace_markdown(events))
+    else:
+        await _render_sidebar(str(cl.user_session.get("workspace", "") or ""), _trace_markdown(cl.user_session.get("trace_events", []) or []))
 
 @cl.on_message
 async def main(message: cl.Message):
+    cmd = str(message.content or "").strip()
+    cmd_l = cmd.lower()
+    if cmd_l in ["/sidebar", "/trace", "/workspace", "/ws"]:
+        ws = str(cl.user_session.get("workspace", "") or "").strip() or "*Workspace is empty.*"
+        tr = _trace_markdown(cl.user_session.get("trace_events", []) or []) or "*Trace is empty.*"
+        await cl.Message(content=f"## Workspace\n\n{ws}\n\n## Trace\n\n{tr}").send()
+        return
+    if cmd_l in ["/hydrate", "/resume"]:
+        trace_session_id = _pick_trace_session_id()
+        if trace_session_id:
+            events = _read_jsonl(os.path.join(TRACE_DIR, f"{trace_session_id}.jsonl"))
+            workspace = _extract_workspace_from_events(events)
+            cl.user_session.set("trace_session_id", trace_session_id)
+            cl.user_session.set("trace_events", events)
+            cl.user_session.set("workspace", workspace)
+            await _render_sidebar(workspace, _trace_markdown(events))
+            await cl.Message(content=f"已从 traces 恢复：{trace_session_id}").send()
+        else:
+            await cl.Message(content="未找到可恢复的 traces/*.jsonl").send()
+        return
+    if cmd_l in ["/clear", "/reset", "/clearws"]:
+        cl.user_session.set("workspace", "")
+        cl.user_session.set("trace_events", [])
+        await _render_sidebar("", "")
+        await cl.Message(content="已清空 Workspace/Trace。").send()
+        return
     # Get current state from session or just maintain history via LangGraph?
     # LangGraph is stateful. We should maintain the state or just pass messages.
     # For this simple MVP, we'll let LangGraph handle the state but we need to persist it 
@@ -396,8 +528,7 @@ async def main(message: cl.Message):
             workspace_updates.append(msg.content.split("WORKSPACE_UPDATE::", 1)[1].strip())
 
     if workspace_updates:
-        current_workspace = cl.user_session.get("workspace", "")
-        merged = (current_workspace + "\n\n" + "\n\n".join(workspace_updates)).strip() if current_workspace else "\n\n".join(workspace_updates).strip()
+        merged = "\n\n".join(workspace_updates).strip()
         cl.user_session.set("workspace", merged)
         events = cl.user_session.get("trace_events", []) or []
         await _render_sidebar(merged, _trace_markdown(events))

@@ -7,6 +7,8 @@ from langchain_core.tools import tool
 
 DATA_DIR = os.path.join(os.getcwd(), "data", "processed")
 MEMORY_DIR = os.path.join(os.getcwd(), "data", "memory")
+HYBRID_INDEX_DB_PATH = os.environ.get("HYBRID_INDEX_DB_PATH", os.path.join(os.getcwd(), "data", "hybrid_index.db"))
+HYBRID_VECTOR_DB_PATH = os.environ.get("HYBRID_VECTOR_DB_PATH", os.path.join(os.getcwd(), "data", "faiss_index"))
 
 # Ensure memory directory exists
 os.makedirs(MEMORY_DIR, exist_ok=True)
@@ -14,8 +16,25 @@ os.makedirs(MEMORY_DIR, exist_ok=True)
 EPISODIC_MEMORY_FILE = os.path.join(MEMORY_DIR, "episodic_memory.jsonl")
 SEMANTIC_KNOWLEDGE_FILE = os.path.join(MEMORY_DIR, "semantic_knowledge.md")
 
+_HYBRID_INDEXER: Any = None
+
 def _get_paper_dir(paper_id: str) -> str:
     return os.path.join(DATA_DIR, paper_id)
+
+def _get_hybrid_indexer():
+    global _HYBRID_INDEXER
+    if _HYBRID_INDEXER is not None:
+        return _HYBRID_INDEXER
+
+    enable_vector = str(os.environ.get("HYBRID_VECTOR_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    from src.ingestion.indexer import HybridIndexer
+
+    _HYBRID_INDEXER = HybridIndexer(
+        db_path=HYBRID_INDEX_DB_PATH,
+        vector_db_path=HYBRID_VECTOR_DB_PATH,
+        enable_vector=enable_vector,
+    )
+    return _HYBRID_INDEXER
 
 @tool
 def get_library_structure() -> List[Dict[str, Any]]:
@@ -42,6 +61,56 @@ def get_library_structure() -> List[Dict[str, Any]]:
                 )
 
     return library
+
+@tool
+def hybrid_search(query: str, k: int = 6, paper_id: Optional[str] = None, alpha: float = 0.7) -> str:
+    """
+    Search paper chunks using hybrid retrieval (vector + keyword fusion).
+    Returns a JSON list of the most relevant chunk texts with metadata.
+    """
+    q = str(query or "").strip()
+    if not q:
+        return "[]"
+
+    try:
+        indexer = _get_hybrid_indexer()
+    except Exception as e:
+        return json.dumps({"error": f"Hybrid index not available: {e}"}, ensure_ascii=False)
+
+    fetch_k = int(k) if int(k) > 0 else 6
+    if paper_id:
+        fetch_k = max(fetch_k * 4, fetch_k)
+
+    try:
+        docs = indexer.search(q, k=fetch_k, alpha=float(alpha))
+    except Exception as e:
+        return json.dumps({"error": f"Hybrid search failed: {e}"}, ensure_ascii=False)
+
+    pid = str(paper_id or "").strip()
+    if pid:
+        docs = [d for d in docs if (d.metadata or {}).get("paper_id") == pid]
+
+    out: List[Dict[str, Any]] = []
+    max_chars = int(os.environ.get("HYBRID_SNIPPET_MAX_CHARS", "1400"))
+    for d in docs[: int(k)]:
+        md = d.metadata or {}
+        content = str(d.page_content or "")
+        if max_chars > 0 and len(content) > max_chars:
+            content = content[: max_chars].rstrip() + "…"
+        out.append(
+            {
+                "paper_id": md.get("paper_id"),
+                "title": md.get("title"),
+                "section_title": md.get("section_title"),
+                "chunk_index": md.get("chunk_index"),
+                "chunk_start_token": md.get("chunk_start_token"),
+                "chunk_end_token": md.get("chunk_end_token"),
+                "content": content,
+                "source": md.get("source"),
+            }
+        )
+
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 @tool
 def read_section_content(paper_id: str, section_title: str) -> str:

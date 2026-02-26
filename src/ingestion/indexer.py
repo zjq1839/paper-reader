@@ -5,6 +5,7 @@ from typing import List, Any, Optional, Tuple
 
 import numpy as np
 import faiss
+import re
 from openai import OpenAI
 from langchain_core.documents import Document
 
@@ -105,17 +106,29 @@ class LocalFaissStore:
         return out
 
 class HybridIndexer:
-    def __init__(self, db_path: str = "data/hybrid_index.db", vector_db_path: str = "data/faiss_index"):
+    def __init__(
+        self,
+        db_path: str = "data/hybrid_index.db",
+        vector_db_path: str = "data/faiss_index",
+        enable_vector: bool = True,
+    ):
         self.db_path = db_path
         self.vector_db_path = vector_db_path
-        self.embeddings = NvidiaBgeM3Embeddings()
-        self.vector_store = LocalFaissStore(self.vector_db_path, self.embeddings)
+        self.embeddings: Optional[NvidiaBgeM3Embeddings] = None
+        self.vector_store: Optional[LocalFaissStore] = None
         
         # Ensure directories exist
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         os.makedirs(os.path.dirname(vector_db_path), exist_ok=True)
 
         self._init_sqlite()
+        if enable_vector:
+            try:
+                self.embeddings = NvidiaBgeM3Embeddings()
+                self.vector_store = LocalFaissStore(self.vector_db_path, self.embeddings)
+            except Exception:
+                self.embeddings = None
+                self.vector_store = None
 
     def _init_sqlite(self):
         """Initialize SQLite database with FTS5 for BM25."""
@@ -152,7 +165,8 @@ class HybridIndexer:
         conn.close()
 
         # 2. Add to Vector Store
-        self.vector_store.add_documents(kept)
+        if self.vector_store is not None:
+            self.vector_store.add_documents(kept)
 
     def search(self, query: str, k: int = 5, alpha: float = 0.7) -> List[Document]:
         """
@@ -160,20 +174,42 @@ class HybridIndexer:
         alpha: Weight for vector search (default 0.7). 1.0 = pure vector, 0.0 = pure keyword.
         """
         # 1. Vector Search
-        vector_results = []
-        vector_results_raw = self.vector_store.similarity_search_with_score(query, k=k * 2)
-        vector_results = vector_results_raw
+        vector_results: List[Tuple[Document, float]] = []
+        if self.vector_store is not None:
+            try:
+                vector_results = self.vector_store.similarity_search_with_score(query, k=k * 2)
+            except Exception:
+                vector_results = []
 
         # 2. Keyword Search (SQLite FTS)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT content, metadata, bm25(documents_fts) AS score
-            FROM documents_fts 
-            WHERE documents_fts MATCH ? 
-            ORDER BY score 
-            LIMIT ?
-        """, (query, k*2))
+        try:
+            cursor.execute(
+                """
+                SELECT content, metadata, bm25(documents_fts) AS score
+                FROM documents_fts 
+                WHERE documents_fts MATCH ? 
+                ORDER BY score 
+                LIMIT ?
+                """,
+                (query, k * 2),
+            )
+        except Exception:
+            tokens = re.findall(r"[0-9A-Za-z\u4e00-\u9fff]+", str(query or ""))
+            safe_query = " ".join(tokens).strip()
+            if safe_query:
+                safe_query = f"\"{safe_query}\""
+            cursor.execute(
+                """
+                SELECT content, metadata, bm25(documents_fts) AS score
+                FROM documents_fts 
+                WHERE documents_fts MATCH ? 
+                ORDER BY score 
+                LIMIT ?
+                """,
+                (safe_query, k * 2),
+            )
         
         rows = cursor.fetchall()
         conn.close()
