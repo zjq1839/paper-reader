@@ -30,6 +30,8 @@ class PDFParser:
             except ImportError:
                 logger.warning("MinerU (magic-pdf) not installed or failed to import. Falling back to PyMuPDF.")
             except Exception as e:
+                if self._env_truthy("MINERU_FAIL_FAST", default=False):
+                    raise
                 logger.error(f"MinerU parsing failed: {e}. Falling back to PyMuPDF.")
 
         if self._is_url(pdf_path):
@@ -156,9 +158,11 @@ class PDFParser:
             raise RuntimeError(f"MinerU API batch returned unexpected state: {state}, payload: {target}")
 
     def _download_zip_and_extract_markdown(self, zip_url: str) -> str:
-        req = Request(zip_url, method="GET")
-        with urlopen(req, timeout=120) as resp:
-            zip_bytes = resp.read()
+        zip_bytes = self._http_get_bytes(
+            url=zip_url,
+            headers=None,
+            timeout_s=self._env_int("MINERU_ZIP_TIMEOUT_S", default=120),
+        )
 
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             md_name = self._pick_markdown_file(zf.namelist())
@@ -185,32 +189,25 @@ class PDFParser:
     def _upload_file_put(self, upload_url: str, file_path: str) -> None:
         try:
             import requests
+        except Exception:
+            requests = None
 
+        if requests is not None:
             with open(file_path, "rb") as f:
-                resp = requests.put(upload_url, data=f, timeout=120)
+                resp = requests.put(upload_url, data=f, timeout=self._env_int("MINERU_UPLOAD_TIMEOUT_S", default=120))
             if resp.status_code != 200:
                 raise RuntimeError(f"Upload failed: HTTP {resp.status_code}, body: {resp.text[:500]}")
             return
-        except Exception:
-            pass
 
         with open(file_path, "rb") as f:
             data = f.read()
         req = Request(upload_url, method="PUT", data=data)
-        with urlopen(req, timeout=120) as resp:
-            if getattr(resp, "status", 200) != 200:
-                raise RuntimeError(f"Upload failed: HTTP {getattr(resp, 'status', 'unknown')}")
+        self._urlopen_read_bytes(req, timeout_s=self._env_int("MINERU_UPLOAD_TIMEOUT_S", default=120))
 
     def _mineru_post_json(self, path: str, payload: Dict[str, Any], token: str, base_url: str) -> Dict[str, Any]:
         endpoint = f"{base_url}{path}"
-        req = Request(
-            endpoint,
-            method="POST",
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-            data=json.dumps(payload).encode("utf-8"),
-        )
-        raw = self._urlopen_read_text(req)
-        data = self._parse_json(raw)
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        data = self._http_json(method="POST", url=endpoint, headers=headers, json_payload=payload)
         if isinstance(data, dict) and data.get("code") not in (None, 0):
             raise RuntimeError(f"MinerU API error: {data}")
         if not isinstance(data, dict):
@@ -219,28 +216,97 @@ class PDFParser:
 
     def _mineru_get_json(self, path: str, token: str, base_url: str) -> Dict[str, Any]:
         endpoint = f"{base_url}{path}"
-        req = Request(endpoint, method="GET", headers={"Authorization": f"Bearer {token}"})
-        raw = self._urlopen_read_text(req)
-        data = self._parse_json(raw)
+        headers = {"Authorization": f"Bearer {token}"}
+        data = self._http_json(method="GET", url=endpoint, headers=headers, json_payload=None)
         if isinstance(data, dict) and data.get("code") not in (None, 0):
             raise RuntimeError(f"MinerU API error: {data}")
         if not isinstance(data, dict):
             raise RuntimeError(f"MinerU API returned unexpected payload: {data}")
         return data
 
-    def _urlopen_read_text(self, req: Request) -> str:
+    def _http_json(self, method: str, url: str, headers: Optional[Dict[str, str]], json_payload: Optional[Dict[str, Any]]) -> Any:
+        if self._use_requests():
+            return self._requests_json(method=method, url=url, headers=headers, json_payload=json_payload)
+        req = self._build_urllib_request(method=method, url=url, headers=headers, json_payload=json_payload)
+        raw = self._urlopen_read_bytes(req, timeout_s=self._env_int("MINERU_HTTP_TIMEOUT_S", default=60)).decode(
+            "utf-8", errors="replace"
+        )
+        return self._parse_json(raw)
+
+    def _http_get_bytes(self, url: str, headers: Optional[Dict[str, str]], timeout_s: int) -> bytes:
+        if self._use_requests():
+            return self._requests_bytes(method="GET", url=url, headers=headers, data=None, timeout_s=timeout_s)
+        req = self._build_urllib_request(method="GET", url=url, headers=headers, json_payload=None)
+        return self._urlopen_read_bytes(req, timeout_s=timeout_s)
+
+    def _urlopen_read_bytes(self, req: Request, timeout_s: int) -> bytes:
+        retries = self._env_int("MINERU_HTTP_RETRIES", default=3)
+        backoff_s = self._env_int("MINERU_HTTP_BACKOFF_S", default=1)
+        url = getattr(req, "full_url", "")
         try:
-            with urlopen(req, timeout=60) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except HTTPError as e:
-            detail = ""
+            method = req.get_method()
+        except Exception:
+            method = ""
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max(retries, 1)):
             try:
-                detail = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise RuntimeError(f"MinerU API HTTPError {e.code}: {detail or str(e)}") from e
-        except URLError as e:
-            raise RuntimeError(f"MinerU API request failed: {e}") from e
+                with urlopen(req, timeout=timeout_s) as resp:
+                    return resp.read()
+            except HTTPError as e:
+                detail = b""
+                try:
+                    detail = e.read()
+                except Exception:
+                    pass
+                code = getattr(e, "code", None)
+                if attempt + 1 < max(retries, 1) and self._should_retry_http_status(code):
+                    time.sleep(backoff_s * (2**attempt))
+                    last_exc = e
+                    continue
+                try:
+                    detail_text = detail.decode("utf-8", errors="replace")
+                except Exception:
+                    detail_text = str(detail)
+                raise RuntimeError(f"HTTPError {code} {method} {url}: {detail_text[:800]}") from e
+            except URLError as e:
+                if attempt + 1 < max(retries, 1) and self._should_retry_url_error(e):
+                    time.sleep(backoff_s * (2**attempt))
+                    last_exc = e
+                    continue
+                raise RuntimeError(f"urlopen error {method} {url}: {e}") from e
+            except OSError as e:
+                if attempt + 1 < max(retries, 1) and self._should_retry_os_error(e):
+                    time.sleep(backoff_s * (2**attempt))
+                    last_exc = e
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise RuntimeError(f"urlopen failed after retries {method} {url}: {last_exc}") from last_exc
+        raise RuntimeError("urlopen failed after retries")
+
+    def _should_retry_http_status(self, code: Any) -> bool:
+        try:
+            code_int = int(code)
+        except Exception:
+            return False
+        return code_int in (429, 500, 502, 503, 504)
+
+    def _should_retry_url_error(self, e: URLError) -> bool:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, OSError):
+            return self._should_retry_os_error(reason)
+        return True
+
+    def _should_retry_os_error(self, e: OSError) -> bool:
+        win = getattr(e, "winerror", None)
+        if win in (10053, 10054, 10060, 11001):
+            return True
+        err = getattr(e, "errno", None)
+        if err in (54, 60, 11001):
+            return True
+        return False
 
     def _parse_json(self, raw: str) -> Any:
         try:
@@ -316,9 +382,91 @@ class PDFParser:
         return None
 
     def _fetch_text_url(self, url: str) -> str:
-        req = Request(url, method="GET")
-        with urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+        b = self._http_get_bytes(url=url, headers=None, timeout_s=self._env_int("MINERU_HTTP_TIMEOUT_S", default=60))
+        return b.decode("utf-8", errors="replace")
+
+    def _use_requests(self) -> bool:
+        if not self._env_truthy("MINERU_USE_REQUESTS", default=True):
+            return False
+        try:
+            import requests  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _requests_json(
+        self, method: str, url: str, headers: Optional[Dict[str, str]], json_payload: Optional[Dict[str, Any]]
+    ) -> Any:
+        resp_bytes = self._requests_bytes(
+            method=method,
+            url=url,
+            headers=headers,
+            data=None if json_payload is None else json.dumps(json_payload).encode("utf-8"),
+            timeout_s=self._env_int("MINERU_HTTP_TIMEOUT_S", default=60),
+            force_content_type_json=json_payload is not None,
+        )
+        raw = resp_bytes.decode("utf-8", errors="replace")
+        return self._parse_json(raw)
+
+    def _requests_bytes(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]],
+        data: Optional[bytes],
+        timeout_s: int,
+        force_content_type_json: bool = False,
+    ) -> bytes:
+        import requests
+
+        retries = self._env_int("MINERU_HTTP_RETRIES", default=3)
+        backoff_s = self._env_int("MINERU_HTTP_BACKOFF_S", default=1)
+
+        req_headers: Dict[str, str] = {}
+        if headers:
+            req_headers.update(headers)
+        if force_content_type_json and "Content-Type" not in req_headers:
+            req_headers["Content-Type"] = "application/json"
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max(retries, 1)):
+            try:
+                resp = requests.request(method=method, url=url, headers=req_headers, data=data, timeout=timeout_s)
+                if resp.status_code >= 400:
+                    if attempt + 1 < max(retries, 1) and self._should_retry_http_status(resp.status_code):
+                        time.sleep(backoff_s * (2**attempt))
+                        last_exc = RuntimeError(f"HTTP {resp.status_code}")
+                        continue
+                    body = ""
+                    try:
+                        body = resp.text
+                    except Exception:
+                        body = ""
+                    raise RuntimeError(f"HTTPError {resp.status_code} {method} {url}: {body[:800]}")
+                return resp.content
+            except requests.exceptions.RequestException as e:
+                if attempt + 1 < max(retries, 1):
+                    time.sleep(backoff_s * (2**attempt))
+                    last_exc = e
+                    continue
+                raise RuntimeError(f"requests error {method} {url}: {e}") from e
+
+        if last_exc is not None:
+            raise RuntimeError(f"requests failed after retries {method} {url}: {last_exc}") from last_exc
+        raise RuntimeError("requests failed after retries")
+
+    def _build_urllib_request(
+        self, method: str, url: str, headers: Optional[Dict[str, str]], json_payload: Optional[Dict[str, Any]]
+    ) -> Request:
+        body: Optional[bytes] = None
+        req_headers: Dict[str, str] = {}
+        if headers:
+            req_headers.update(headers)
+        if json_payload is not None:
+            body = json.dumps(json_payload).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json")
+        return Request(url, method=method, headers=req_headers, data=body)
 
     def _is_url(self, value: str) -> bool:
         return value.startswith(("http://", "https://"))
