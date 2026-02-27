@@ -27,25 +27,25 @@ DeepScholar 是一个面向论文精读与研究灵感生成的 AI 研究助手�
 
 ```mermaid
 flowchart TD
-  U[用户] -->|提问/对话| CL[Chainlit UI\nsrc/app.py]
-  CL -->|messages(history)| A[Agent\nsrc/agent/lc_agent.py]
-  A -->|tool call| T1[get_library_structure\nsrc/agent/tools.py]
-  A -->|tool call| T2[hybrid_search\nsrc/agent/tools.py]
-  A -->|tool call| T3[read_section_content(分页)\nsrc/agent/tools.py]
-  A -->|tool call| T4[update_workspace\nsrc/agent/tools.py]
-  A -->|tool call| T5[report_status\nsrc/agent/tools.py]
-  T1 --> FS[(data/processed\nindex.json)]
+  U[用户] -->|提问/对话| CL[Chainlit UI<br/>src/app.py]
+  CL -->|messages history| A[Agent<br/>src/agent/lc_agent.py]
+  A -->|tool call| T1[get_library_structure<br/>src/agent/tools.py]
+  A -->|tool call| T2[hybrid_search<br/>src/agent/tools.py]
+  A -->|tool call| T3[read_section_content 分页<br/>src/agent/tools.py]
+  A -->|tool call| T4[update_workspace<br/>src/agent/tools.py]
+  A -->|tool call| T5[report_status<br/>src/agent/tools.py]
+  T1 --> FS[(data/processed<br/>index.json)]
   T2 --> FS[(data/hybrid_index.db + faiss_index)]
   T3 --> FS
   T4 --> CL
   T5 --> CL
-  CL -->|trace events| TR[(data/memory/traces\n*.jsonl)]
+  CL -->|trace events| TR[(data/memory/traces<br/>*.jsonl)]
 
   subgraph ING[离线摄取（Ingestion）]
-    PDF[PDF / PDF URL\n(data/raw_pdfs)] --> P[PDFParser\nsrc/ingestion/parser.py]
+    PDF[PDF / PDF URL<br/>data/raw_pdfs] --> P[PDFParser<br/>src/ingestion/parser.py]
     P --> M[Markdown]
-    M --> S[MarkdownSplitter\nsrc/ingestion/splitter.py]
-    S --> OUT[data/processed/<paper_id>\nindex.json + sections/*.md]
+    M --> S[MarkdownSplitter<br/>src/ingestion/splitter.py]
+    S --> OUT[data/processed/{paper_id}<br/>index.json + sections/*.md]
   end
 ```
 
