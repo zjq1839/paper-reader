@@ -37,14 +37,14 @@ def _get_hybrid_indexer():
     return _HYBRID_INDEXER
 
 @tool
-def get_library_structure(paper_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_library_structure(paper_id: Optional[str] = None) -> str:
     """
     Get the list of available papers and their high-level outline (sections).
     If paper_id is provided, returns structure only for that paper.
     """
     library: List[Dict[str, Any]] = []
     if not os.path.exists(DATA_DIR):
-        return []
+        return "[]"
 
     target_papers = [paper_id] if paper_id else os.listdir(DATA_DIR)
 
@@ -66,7 +66,7 @@ def get_library_structure(paper_id: Optional[str] = None) -> List[Dict[str, Any]
                     }
                 )
 
-    return library
+    return json.dumps(library, ensure_ascii=False, indent=2)
 
 @tool
 def hybrid_search(query: str, k: int = 6, paper_id: Optional[str] = None, alpha: float = 0.7) -> str:

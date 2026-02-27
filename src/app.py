@@ -18,6 +18,8 @@ except Exception:
     pass
 
 import chainlit as cl
+from chainlit.config import config as chainlit_config
+from chainlit.utils import wrap_user_function
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -83,20 +85,30 @@ async def _render_sidebar(workspace: str, trace_md: str) -> None:
         ws = "*Workspace is empty.*"
     if not tr:
         tr = "*Trace is empty.*"
+    MarkdownEl = None
+    try:
+        MarkdownEl = cl.Markdown
+    except Exception:
+        MarkdownEl = None
+    WorkspaceEl = MarkdownEl or cl.Text
     try:
         await cl.ElementSidebar.set_title("Research Workspace")
         await cl.ElementSidebar.set_elements(
             [
-                cl.Text(name="Research Workspace", content=ws),
-                cl.Text(name="Agent Trace", content=tr),
+                WorkspaceEl(name="Research Workspace", content=ws),
+                WorkspaceEl(name="Agent Trace", content=tr),
             ]
         )
     except Exception:
         for_id = cl.user_session.get("workspace_for_id")
         if not for_id:
             return
-        await cl.Text(name="Research Workspace", content=ws, display="inline").send(for_id=for_id)
-        await cl.Text(name="Agent Trace", content=tr, display="inline").send(for_id=for_id)
+        try:
+            await WorkspaceEl(name="Research Workspace", content=ws, display="inline").send(for_id=for_id)
+            await WorkspaceEl(name="Agent Trace", content=tr, display="inline").send(for_id=for_id)
+        except TypeError:
+            await WorkspaceEl(name="Research Workspace", content=ws).send(for_id=for_id)
+            await WorkspaceEl(name="Agent Trace", content=tr).send(for_id=for_id)
 
 def _read_jsonl(path: str, max_lines: int = 5000) -> list[Dict[str, Any]]:
     items: list[Dict[str, Any]] = []
@@ -426,6 +438,24 @@ def _normalize_history(items):
                 normalized.append(AIMessage(content=content))
             else:
                 normalized.append(HumanMessage(content=content))
+        elif isinstance(it, ToolMessage):
+            raw = it.content
+            if isinstance(raw, str):
+                normalized.append(it)
+                continue
+            fixed = "" if raw is None else _safe_json_dumps(raw)
+            tool_call_id = getattr(it, "tool_call_id", None)
+            name = getattr(it, "name", None)
+            if tool_call_id:
+                kwargs = {"tool_call_id": tool_call_id}
+                if name:
+                    kwargs["name"] = name
+                try:
+                    normalized.append(ToolMessage(content=fixed, **kwargs))
+                except Exception:
+                    normalized.append(HumanMessage(content=fixed))
+            else:
+                normalized.append(HumanMessage(content=fixed))
         else:
             normalized.append(it)
     return normalized
@@ -519,7 +549,7 @@ async def main(message: cl.Message):
     config = RunnableConfig(callbacks=[ProgressCallbackHandler(str(trace_session_id))])
     res = await agent.ainvoke({"messages": history}, config=config)
 
-    updated_messages = res["messages"]
+    updated_messages = _normalize_history(res["messages"])
     cl.user_session.set("history", updated_messages)
 
     workspace_updates = []
@@ -550,4 +580,13 @@ async def main(message: cl.Message):
     else:
         await cl.Message(content="（本轮模型没有返回可展示的文本内容）").send()
 
+async def _safe_dispatch_message(message):
+    if message is None:
+        return
+    await main(message)
+
+try:
+    chainlit_config.code.on_message = wrap_user_function(_safe_dispatch_message)
+except Exception:
+    pass
 
