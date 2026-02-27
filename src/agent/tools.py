@@ -37,16 +37,22 @@ def _get_hybrid_indexer():
     return _HYBRID_INDEXER
 
 @tool
-def get_library_structure() -> List[Dict[str, Any]]:
+def get_library_structure(paper_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Get the list of available papers and their high-level outline (sections).
+    If paper_id is provided, returns structure only for that paper.
     """
     library: List[Dict[str, Any]] = []
     if not os.path.exists(DATA_DIR):
         return []
 
-    for paper_id in os.listdir(DATA_DIR):
-        paper_path = _get_paper_dir(paper_id)
+    target_papers = [paper_id] if paper_id else os.listdir(DATA_DIR)
+
+    for pid in target_papers:
+        paper_path = _get_paper_dir(pid)
+        if not os.path.exists(paper_path): 
+            continue
+            
         index_path = os.path.join(paper_path, "index.json")
 
         if os.path.exists(index_path):
@@ -54,7 +60,7 @@ def get_library_structure() -> List[Dict[str, Any]]:
                 data = json.load(f)
                 library.append(
                     {
-                        "paper_id": paper_id,
+                        "paper_id": pid,
                         "title": data.get("title", "Untitled"),
                         "sections": [s["title"] for s in data.get("sections", [])],
                     }
@@ -113,9 +119,12 @@ def hybrid_search(query: str, k: int = 6, paper_id: Optional[str] = None, alpha:
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 @tool
-def read_section_content(paper_id: str, section_title: str) -> str:
+def read_section_content(paper_id: str, section_title: str, page: int = 1, chars_per_page: int = 4000) -> str:
     """
-    Read the full content of a specific section from a paper.
+    Read the content of a specific section from a paper.
+    If content is long, it returns a specific page.
+    page: Page number (1-based).
+    chars_per_page: Number of characters per page (default 4000).
     """
     paper_path = _get_paper_dir(paper_id)
     sections_dir = os.path.join(paper_path, "sections")
@@ -139,7 +148,29 @@ def read_section_content(paper_id: str, section_title: str) -> str:
     section_path = os.path.join(sections_dir, target_filename)
     if os.path.exists(section_path):
         with open(section_path, "r", encoding="utf-8") as f:
-            return f.read()
+            content = f.read()
+            
+        total_chars = len(content)
+        if total_chars <= chars_per_page:
+            return content
+            
+        total_pages = math.ceil(total_chars / chars_per_page)
+        
+        if page < 1 or page > total_pages:
+            return f"Error: Page {page} out of range (1-{total_pages})."
+            
+        start_idx = (page - 1) * chars_per_page
+        end_idx = min(start_idx + chars_per_page, total_chars)
+        
+        chunk = content[start_idx:end_idx]
+        
+        return f"""[SECTION CONTENT - Page {page}/{total_pages}]
+{chunk}
+
+[SYSTEM NOTE]
+This section is long ({total_chars} chars). You are viewing page {page} of {total_pages}.
+To read the next part, call `read_section_content(paper_id="{paper_id}", section_title="{section_title}", page={page+1})`.
+"""
             
     return "Error: Section content file not found."
 

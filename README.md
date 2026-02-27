@@ -7,6 +7,13 @@ DeepScholar 是一个面向论文精读与研究灵感生成的 AI 研究助手�
 - 背景：传统“切片 + 向量检索”的 RAG 容易丢失跨段落的宏观语境与逻辑链路，难以模拟专家式的“先看结构、再追细节”的阅读方式。
 - 目标：以“渐进式披露（Progressive Disclosure）”为核心策略，让 Agent 先浏览论文库大纲，再按需读取章节内容，最终输出可追溯到原文段落的综合结论，并把关键证据/灵感沉淀到 Workspace。
 
+## 上下文窗口（Context Window）策略
+
+- 渐进式披露：优先 `hybrid_search` 获取短证据片段；仅在需要时分页读取章节内容（避免一次性加载超长 Markdown）。
+- Token 阈值触发压缩：基于消息内容长度估算 Token 使用率，超过 `MAX_CONTEXT_TOKENS` 的 95% 时自动触发“摘要压缩”。
+- 摘要式续写：压缩节点会把旧历史融合进 `summary`，后续对话用「summary + 最近消息」维持推理链不断裂。
+- 状态感知：系统提示词会注入已读章节列表（READ HISTORY），降低重复读取同一章节的概率。
+
 ## 技术栈
 
 - 语言：Python
@@ -14,7 +21,7 @@ DeepScholar 是一个面向论文精读与研究灵感生成的 AI 研究助手�
 - Agent：LangGraph + LangChain + NVIDIA NIM（`langchain-nvidia-ai-endpoints` 的 `ChatNVIDIA`）
 - 文档解析：MinerU（`magic-pdf`，本地或 API）+ PyMuPDF（失败回退/本地解析）
 - 配置：python-dotenv（加载 `.env`）
-- 预留依赖（当前代码未显式使用）：FastAPI、uvicorn、numpy、scikit-learn、rank_bm25
+- 检索：SQLite FTS5（BM25）+ 可选 FAISS 向量检索（NVIDIA Embedding / bge-m3）
 
 ## 系统架构（模块划分与数据流）
 
@@ -23,13 +30,15 @@ flowchart TD
   U[用户] -->|提问/对话| CL[Chainlit UI\nsrc/app.py]
   CL -->|messages(history)| A[Agent\nsrc/agent/lc_agent.py]
   A -->|tool call| T1[get_library_structure\nsrc/agent/tools.py]
-  A -->|tool call| T2[read_section_content\nsrc/agent/tools.py]
-  A -->|tool call| T3[update_workspace\nsrc/agent/tools.py]
-  A -->|tool call| T4[report_status\nsrc/agent/tools.py]
+  A -->|tool call| T2[hybrid_search\nsrc/agent/tools.py]
+  A -->|tool call| T3[read_section_content(分页)\nsrc/agent/tools.py]
+  A -->|tool call| T4[update_workspace\nsrc/agent/tools.py]
+  A -->|tool call| T5[report_status\nsrc/agent/tools.py]
   T1 --> FS[(data/processed\nindex.json)]
-  T2 --> FS
-  T3 --> CL
+  T2 --> FS[(data/hybrid_index.db + faiss_index)]
+  T3 --> FS
   T4 --> CL
+  T5 --> CL
   CL -->|trace events| TR[(data/memory/traces\n*.jsonl)]
 
   subgraph ING[离线摄取（Ingestion）]
@@ -49,7 +58,8 @@ flowchart TD
 - Agent 与工具（`src/agent/*`）
   - [`lc_agent.py`](file:///e:/work/paper-reader/src/agent/lc_agent.py)：LangGraph 工作流入口（对外暴露 `agent`）。
   - [`prompts.py`](file:///e:/work/paper-reader/src/agent/prompts.py)：约束 Agent 的“先看大纲再读章节”“先 `report_status` 再调用其它工具”等策略。
-  - [`tools.py`](file:///e:/work/paper-reader/src/agent/tools.py)：从 `data/processed/` 读取论文结构与章节内容，并通过 `WORKSPACE_UPDATE::` 协议与 UI 同步侧边栏笔记。
+  - [`tools.py`](file:///e:/work/paper-reader/src/agent/tools.py)：论文结构、混合检索（SQLite FTS + 可选向量）、章节分页读取，并通过 `WORKSPACE_UPDATE::` 协议与 UI 同步侧边栏笔记。
+  - [`graph.py`](file:///e:/work/paper-reader/src/agent/graph.py)：上下文窗口策略与生命周期管理（Token 阈值触发摘要压缩、summary 注入、READ HISTORY 注入）。
 - UI 入口（`src/app.py`）
   - [`app.py`](file:///e:/work/paper-reader/src/app.py)：Chainlit 事件处理（chat_start/on_message）、历史消息管理、侧边栏 Workspace 渲染、LLM/工具轨迹 Step 展示，并将事件落盘到 `data/memory/traces/*.jsonl`。
 
@@ -80,7 +90,7 @@ e:\work\paper-reader
 │       ├── pipeline.py
 │       ├── parser.py
 │       ├── splitter.py
-│       └── indexer.py             # 占位实现
+│       └── indexer.py             # HybridIndexer：SQLite FTS + 可选 FAISS
 ├── transformers/
 │   └── __init__.py                # 轻量 shim（避免某些依赖强制引入 transformers）
 ├── requirements.txt
@@ -132,13 +142,21 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ### 2) 运行时环境变量（可选覆盖）
 
-Agent 相关（见 [`lc_agent.py`](file:///e:/work/paper-reader/src/agent/lc_agent.py)）：
+Agent 相关（见 [`graph.py`](file:///e:/work/paper-reader/src/agent/graph.py)）：
 
 - `NVIDIA_API_KEY`：必填；未设置会直接报错
 - `NVIDIA_MODEL`：默认 `qwen/qwen3.5-397b-a17b`
-- `NVIDIA_TEMPERATURE`：默认 `0.6`
-- `NVIDIA_TOP_P`：默认 `0.95`
-- `NVIDIA_MAX_TOKENS`：默认 `204800`
+- `NVIDIA_MAX_TOKENS`：单次回答的最大输出 token（completion tokens），默认 `4096`
+- `MAX_CONTEXT_TOKENS`：上下文窗口估算上限（用于触发摘要压缩），默认 `32000`
+
+混合检索相关（见 [`tools.py`](file:///e:/work/paper-reader/src/agent/tools.py) 与 [`indexer.py`](file:///e:/work/paper-reader/src/ingestion/indexer.py)）：
+
+- `HYBRID_INDEX_DB_PATH`：SQLite FTS 索引路径，默认 `data/hybrid_index.db`
+- `HYBRID_VECTOR_DB_PATH`：向量索引目录，默认 `data/faiss_index`
+- `HYBRID_VECTOR_ENABLED`：是否启用向量检索，默认 `1`（可设为 `0` 仅用 FTS）
+- `HYBRID_SNIPPET_MAX_CHARS`：`hybrid_search` 返回片段最大字符数，默认 `1400`
+- `NVIDIA_BASE_URL`：Embedding/推理 API Base URL，默认 `https://integrate.api.nvidia.com/v1`
+- `NVIDIA_EMBED_MODEL`：Embedding 模型名，默认 `baai/bge-m3`
 
 MinerU 相关（见 [`parser.py`](file:///e:/work/paper-reader/src/ingestion/parser.py)）：
 
@@ -201,7 +219,7 @@ cd e:\work\paper-reader
 当前测试基于 `unittest`（见 [`tests/test_agent.py`](file:///e:/work/paper-reader/tests/test_agent.py)），覆盖：
 
 - `get_library_structure`：能从 `data/processed/*/index.json` 读取结构
-- `read_section_content`：能根据 section title 读取对应 Markdown 文件
+- `read_section_content`：能根据 section title 读取对应 Markdown 文件（长章节支持分页读取，默认读取第 1 页）
 
 运行方式（Windows / PowerShell）：
 
@@ -243,6 +261,10 @@ print(library)
 
 content = read_section_content.invoke({"paper_id": "paper_a", "section_title": "Abstract"})
 print(content)
+
+# 长章节分页读取（第 2 页）
+page2 = read_section_content.invoke({"paper_id": "paper_a", "section_title": "Method", "page": 2})
+print(page2)
 ```
 
 ## 贡献规范

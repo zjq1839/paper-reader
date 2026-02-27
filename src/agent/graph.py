@@ -1,6 +1,6 @@
 import os
 from typing import Annotated, Literal, TypedDict
-from langchain_core.messages import SystemMessage, BaseMessage, ToolMessage
+from langchain_core.messages import SystemMessage, BaseMessage, ToolMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -20,8 +20,25 @@ class AgentState(TypedDict):
     working_workspace: str
     semantic_directives: str
     episodic_events: list[str]
+    summary: str
 
 CORE_FILE = os.path.join(os.getcwd(), "docs", "DEEPSCHOLAR_CORE.md")
+
+def estimate_tokens(messages: list[BaseMessage]) -> int:
+    total_chars = 0
+    for msg in messages:
+        if isinstance(msg.content, str):
+            total_chars += len(msg.content)
+        elif isinstance(msg.content, list):
+             for part in msg.content:
+                 if isinstance(part, str):
+                     total_chars += len(part)
+                 elif isinstance(part, dict) and "text" in part:
+                     total_chars += len(part["text"])
+    return total_chars // 4
+
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "32000"))
+COMPACTION_THRESHOLD = int(MAX_CONTEXT_TOKENS * 0.95)
 
 def load_core_constraints():
     if os.path.exists(CORE_FILE):
@@ -64,11 +81,24 @@ async def agent_node(state: AgentState):
     
     # Calculate current workspace from message history
     workspace_content = []
+    read_sections = set()
+    
     for msg in messages:
         if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and msg.content.startswith("WORKSPACE_UPDATE::"):
             workspace_content.append(msg.content.split("WORKSPACE_UPDATE::", 1)[1].strip())
+        
+        # Track read history
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["name"] == "read_section_content":
+                    args = tc["args"]
+                    pid = args.get("paper_id")
+                    sec = args.get("section_title")
+                    if pid and sec:
+                        read_sections.add(f"- {pid} / {sec}")
     
     working_workspace = "\n\n".join(workspace_content) if workspace_content else ""
+    read_history_str = "\n".join(sorted(read_sections)) if read_sections else "None"
     
     core_constraints = load_core_constraints()
     state["semantic_directives"] = core_constraints
@@ -83,18 +113,54 @@ async def agent_node(state: AgentState):
 [CURRENT WORKSPACE]
 {workspace}
 
+[READ HISTORY]
+{read_history_str}
+
 Please assist the user with their research inquiries.
 For evidence gathering, prefer calling `hybrid_search` to retrieve relevant snippets. Only call `read_section_content` when you need full-section context.
 """
     
-    response = await llm_with_tools.ainvoke([SystemMessage(content=system_prompt)] + messages)
+    # Use summary if available to reduce context
+    if state.get("summary"):
+        summary_msg = SystemMessage(content=f"[PREVIOUS CONVERSATION SUMMARY]:\n{state['summary']}")
+        # Keep the last 10 messages for immediate context
+        context_messages = [summary_msg] + messages[-10:]
+    else:
+        context_messages = messages
+
+    response = await llm_with_tools.ainvoke([SystemMessage(content=system_prompt)] + context_messages)
     return {"messages": [response], "working_workspace": working_workspace}
 
-def compaction_node(state: AgentState):
+async def compaction_node(state: AgentState):
     """
-    Compresses history when token limit is reached.
+    Compresses history when token limit is reached using the LLM.
     """
-    return {"messages": [SystemMessage(content="[System: Context compacted for memory optimization.]")]}
+    messages = state["messages"]
+    current_summary = state.get("summary", "")
+    
+    # Summarize history except the last few messages
+    msgs_to_summarize = messages[:-5]
+    if not msgs_to_summarize:
+        return {"messages": []}
+
+    summary_prompt = f"""
+    You are a context optimization assistant.
+    Your task is to merge the new conversation history into the existing summary.
+    
+    [EXISTING SUMMARY]
+    {current_summary}
+    
+    [NEW HISTORY TO MERGE]
+    {msgs_to_summarize} 
+    
+    Please produce a single, dense paragraph summarizing the entire conversation history, preserving key facts, decisions, and workspace updates.
+    """
+    
+    # Use a separate LLM call (or the same one)
+    response = await llm.ainvoke([SystemMessage(content=summary_prompt)])
+    new_summary = response.content
+    
+    return {"summary": new_summary, "messages": [SystemMessage(content=f"[System: Context compacted. Previous history summarized.]")]}
 
 def router(state: AgentState) -> Literal["compaction", "tools", "__end__"]:
     messages = state["messages"]
@@ -103,7 +169,7 @@ def router(state: AgentState) -> Literal["compaction", "tools", "__end__"]:
     if last_message.tool_calls:
         return "tools"
         
-    if len(messages) > 50: 
+    if estimate_tokens(messages) > COMPACTION_THRESHOLD: 
         return "compaction"
     
     return "__end__"
